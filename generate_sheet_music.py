@@ -340,11 +340,12 @@ def extract_training_samples(full_img: Image.Image, root: BBox,
                         or None for the 'none' sentinel.
     """
     samples = []
-    _traverse(full_img, root, samples)
+    _traverse(full_img, root, samples, parent_label=root.label)
     return samples
 
 
-def _traverse(full_img: Image.Image, node: BBox, samples: list):
+def _traverse(full_img: Image.Image, node: BBox, samples: list,
+              parent_label: str = ''):
     if not node.children:
         return
 
@@ -363,6 +364,8 @@ def _traverse(full_img: Image.Image, node: BBox, samples: list):
     children = sorted(node.children, key=lambda c: c.x1)
 
     working = node_crop.copy()
+    prev_bbox = (0.0, 0.0, 0.0, 0.0, 0.0)  # none for first child
+
     for child in children:
         # Normalised bbox relative to node crop
         rel = (
@@ -384,7 +387,13 @@ def _traverse(full_img: Image.Image, node: BBox, samples: list):
             'target_bbox': rel,
             'target_class': child.label,
             'child_image': child_crop,
+            'prev_bbox': prev_bbox,
+            'parent_class': parent_label,
         })
+
+        # Update prev_bbox: normalised coords + class_id
+        prev_bbox = (rel[0], rel[1], rel[2], rel[3],
+                     float(CLASS_TO_ID[child.label]))
 
         # Mask the child out of the working image
         mx1 = max(0, int(child.x1 - nx1))
@@ -393,17 +402,19 @@ def _traverse(full_img: Image.Image, node: BBox, samples: list):
         my2 = min(node_h, int(child.y2 - ny1))
         ImageDraw.Draw(working).rectangle([mx1, my1, mx2, my2], fill='white')
 
-    # Sentinel: no more children
+    # Sentinel: no more children (prev_bbox is the last child detected)
     samples.append({
         'input_image': working.copy(),
         'target_bbox': (0.0, 0.0, 0.0, 0.0),
         'target_class': 'none',
         'child_image': None,
+        'prev_bbox': prev_bbox,
+        'parent_class': parent_label,
     })
 
     # Recurse into each child
     for child in children:
-        _traverse(full_img, child, samples)
+        _traverse(full_img, child, samples, parent_label=child.label)
 
 
 # ──────────────────────────────────────────────────────────────────────────────
