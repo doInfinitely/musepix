@@ -34,7 +34,7 @@ import torch.nn as nn
 import torch.optim as optim
 import torchvision.models as models
 from torch.utils.data import Dataset, DataLoader, random_split
-from PIL import Image, ImageDraw
+from PIL import Image
 
 from retina import fit_to_retina, image_to_tensor
 from generate_sheet_music import (
@@ -295,7 +295,7 @@ def train(args):
 
     os.makedirs('checkpoints', exist_ok=True)
     pf = getattr(args, 'parent_filter', None)
-    ckpt_path = (f'checkpoints/music_ocr_v2_pretrain_{pf}.pt'
+    ckpt_path = (f'checkpoints/music_ocr_v2_finetune_{pf}.pt'
                  if pf else 'checkpoints/music_ocr_v2.pt')
 
     for epoch in range(1, args.epochs + 1):
@@ -412,7 +412,8 @@ def hierarchical_decode(model: MusicOCRModel, image: Image.Image,
                         max_detections: int = 500, device=None):
     """
     Recursively decode the bounding-box hierarchy using autoregressive
-    previous-bbox conditioning.
+    previous-bbox conditioning.  The image is never modified — the model
+    relies solely on prev_bbox to advance through siblings.
 
     Returns a BBox tree.
     """
@@ -428,7 +429,6 @@ def hierarchical_decode(model: MusicOCRModel, image: Image.Image,
 
         parent_area = img.width * img.height
         children = []
-        working = img.copy()
         prev_bbox = PREV_BBOX_NONE
 
         for _ in range(20):  # per-node safety cap
@@ -436,7 +436,7 @@ def hierarchical_decode(model: MusicOCRModel, image: Image.Image,
                 break
 
             bbox_n, cls_name, conf = predict(
-                model, working, prev_bbox=prev_bbox,
+                model, img, prev_bbox=prev_bbox,
                 retina_size=retina_size, device=device)
 
             if cls_name == 'none' or conf < 0.3:
@@ -473,10 +473,6 @@ def hierarchical_decode(model: MusicOCRModel, image: Image.Image,
             prev_bbox = (bbox_n[0], bbox_n[1], bbox_n[2], bbox_n[3],
                          float(CLASS_TO_ID[cls_name]))
 
-            # Mask out this child
-            from PIL import ImageDraw
-            ImageDraw.Draw(working).rectangle([x1, y1, x2, y2], fill='white')
-
         return children
 
     subs = _decode(image, 0)
@@ -497,41 +493,6 @@ def _offset_bbox(node, dx, dy):
         children=[_offset_bbox(c, dx, dy) for c in node.children],
     )
 
-
-def _compute_mask(image, bbox, bg_color=(255, 255, 255),
-                  mask_model=None, device=None):
-    """Compute a grayscale mask of non-background pixels in *bbox*.
-
-    If mask_model is provided, uses the learned segmentation network.
-    Otherwise falls back to simple color comparison.
-
-    Returns an 'L'-mode PIL Image: 255 = content, 0 = background.
-    """
-    x1, y1, x2, y2 = int(bbox[0]), int(bbox[1]), int(bbox[2]), int(bbox[3])
-    region = image.crop((x1, y1, x2, y2))
-
-    if mask_model is not None and device is not None:
-        return mask_model.segment(region, device)
-
-    arr = np.array(region, dtype=np.int16)
-    bg = np.array(bg_color, dtype=np.int16)
-    diff = np.abs(arr - bg).max(axis=2).astype(np.uint8)
-    mask_arr = np.where(diff > 0, 255, 0).astype(np.uint8)
-    return Image.fromarray(mask_arr, mode='L')
-
-
-def _erase_region(image, bbox, mask, bg_color=(255, 255, 255)):
-    """Erase content pixels in *bbox* using *mask*, restoring to bg_color."""
-    image = image.copy()
-    x1, y1, x2, y2 = int(bbox[0]), int(bbox[1]), int(bbox[2]), int(bbox[3])
-    w, h = x2 - x1, y2 - y1
-    if w <= 0 or h <= 0:
-        return image
-    bg_patch = Image.new('RGB', (w, h), bg_color)
-    if mask.size != (w, h):
-        mask = mask.resize((w, h), Image.NEAREST)
-    image.paste(bg_patch, (x1, y1), mask)
-    return image
 
 
 def _find_content_regions(image, bg_color=(255, 255, 255),
@@ -619,7 +580,8 @@ def detect_level(model, source_img, device, retina_size=1024,
     """Detect items at one hierarchy level using hybrid approach.
 
     1. Pixel analysis finds content regions (bounding boxes).
-    2. Model runs autoregressively to count items and get class IDs.
+    2. Model runs autoregressively (conditioned on prev_bbox) to count
+       items and get class IDs.  The image is never modified.
     3. Regions are paired with class predictions.
 
     If mask_model is provided, uses learned segmentation for content detection.
@@ -635,13 +597,12 @@ def detect_level(model, source_img, device, retina_size=1024,
         return []
 
     # Run model autoregressively to count detections and get class names
-    working_img = source_img.copy()
+    retina_img, scale, ox, oy = fit_to_retina(source_img, retina_size)
+    x = image_to_tensor(retina_img).unsqueeze(0).to(device)
     class_names = []
     prev_bbox = PREV_BBOX_NONE
 
     for _ in range(max_detections):
-        retina_img, scale, ox, oy = fit_to_retina(working_img, retina_size)
-        x = image_to_tensor(retina_img).unsqueeze(0).to(device)
         prev_t = torch.tensor([prev_bbox], dtype=torch.float32).to(device)
 
         bbox_pred, cls_pred = model(x, prev_t)
@@ -654,14 +615,9 @@ def detect_level(model, source_img, device, retina_size=1024,
 
         class_names.append(cls_name)
 
-        # Erase the topmost remaining content region using pixel mask
         if len(class_names) <= len(regions):
-            region = regions[len(class_names) - 1]
-            mask = _compute_mask(working_img, region, bg_color,
-                               mask_model=mask_model, device=device)
-            working_img = _erase_region(working_img, region, mask, bg_color)
-
             # Build prev_bbox in normalised coords for next iteration
+            region = regions[len(class_names) - 1]
             w, h = source_img.size
             prev_bbox = (
                 region[0] / w, region[1] / h,

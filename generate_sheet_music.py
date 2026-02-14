@@ -8,7 +8,7 @@ exceed an octave.
 
 The bounding-box tree is then traversed to produce teacher-forcing training
 samples: at each node the children are revealed one at a time (left→right),
-masking previously revealed siblings from the input image.
+conditioning on the previous detection's bbox + class.
 
 Usage:
     python3.10 generate_sheet_music.py --num_images 100 --out_dir data/sheet_music
@@ -28,6 +28,46 @@ from retina import fit_to_retina, image_to_tensor
 # Music theory helpers
 # ──────────────────────────────────────────────────────────────────────────────
 NOTE_NAMES = ['C', 'D', 'E', 'F', 'G', 'A', 'B']
+DIATONIC_SEMITONES = [0, 2, 4, 5, 7, 9, 11]  # C, D, E, F, G, A, B
+
+
+def octave_note_to_midi(octave: int, note_index: int) -> int:
+    """Convert (octave, diatonic note_index) to MIDI note number."""
+    return 12 * (octave + 1) + DIATONIC_SEMITONES[note_index]
+
+
+# Token vocabulary for MIDI decoder
+PAD_TOKEN = 0
+BOS_TOKEN = 1
+EOS_TOKEN = 2
+PITCH_OFFSET = 3
+NUM_PITCHES = 21          # C3..B5 = 3 octaves x 7 diatonic
+MIDI_VOCAB_SIZE = 24      # PAD + BOS + EOS + 21 pitches
+
+# MIDI range: C3 (48) to B5 (83)
+_MIDI_C3 = octave_note_to_midi(3, 0)  # 48
+
+
+def midi_to_token(midi_num: int) -> int:
+    """Convert a MIDI note number (C3..B5) to a token (3..23)."""
+    # Map C3=48 → token 3, D3=50 → token 4, ..., B5=83 → token 23
+    # We use diatonic indices: find octave and note_index, then linear index
+    for oct in range(3, 6):
+        for ni in range(7):
+            if octave_note_to_midi(oct, ni) == midi_num:
+                return PITCH_OFFSET + (oct - 3) * 7 + ni
+    raise ValueError(f'MIDI {midi_num} not in C3..B5 diatonic range')
+
+
+def token_to_midi(token: int) -> int:
+    """Convert a token (3..23) back to a MIDI note number."""
+    if token < PITCH_OFFSET or token >= PITCH_OFFSET + NUM_PITCHES:
+        raise ValueError(f'Token {token} not a pitch token')
+    idx = token - PITCH_OFFSET
+    octave = 3 + idx // 7
+    note_index = idx % 7
+    return octave_note_to_midi(octave, note_index)
+
 
 # Element classes used by the OCR model
 CLASSES = [
@@ -72,16 +112,20 @@ class BBox:
     y2: float
     label: str
     children: List['BBox'] = field(default_factory=list)
+    midi: Optional[int] = None
 
     def as_tuple(self):
         return (self.x1, self.y1, self.x2, self.y2)
 
     def to_dict(self):
-        return {
+        d = {
             'bbox': [self.x1, self.y1, self.x2, self.y2],
             'label': self.label,
             'children': [c.to_dict() for c in self.children],
         }
+        if self.midi is not None:
+            d['midi'] = self.midi
+        return d
 
     @staticmethod
     def from_dict(d):
@@ -90,6 +134,7 @@ class BBox:
             x2=d['bbox'][2], y2=d['bbox'][3],
             label=d['label'],
             children=[BBox.from_dict(c) for c in d.get('children', [])],
+            midi=d.get('midi', None),
         )
 
 
@@ -280,10 +325,10 @@ class SheetMusicGenerator:
             # encompassing note bbox
             all_x = [c.x1 for c in children] + [c.x2 for c in children]
             all_y = [c.y1 for c in children] + [c.y2 for c in children]
-            note_name = NOTE_NAMES[note_idx]
+            midi_num = octave_note_to_midi(octave, note_idx)
             note_bboxes.append(
                 BBox(min(all_x), min(all_y), max(all_x), max(all_y),
-                     'note', children=children))
+                     'note', children=children, midi=midi_num))
 
         # ── melodic line bboxes ──
         ml_bboxes = []
@@ -325,15 +370,15 @@ def extract_training_samples(full_img: Image.Image, root: BBox,
     Walk the bounding-box tree and produce teacher-forcing training tuples.
 
     For every node with children (sorted left → right):
-        1.  Present the node's cropped region as input.
+        1.  Present the node's cropped region as input (unmodified).
         2.  Target = first child bbox (normalised to node crop) + class.
-        3.  Mask that child in the working image (fill white).
+        3.  Condition on the previous detection via prev_bbox.
         4.  Target = second child bbox + class …
         5.  After all children: target = (0,0,0,0), class = 'none'.
         6.  Recurse into each child.
 
     Each sample dict:
-        input_image   — PIL Image (the node crop, possibly with prior siblings masked)
+        input_image   — PIL Image (the node crop, always unmodified)
         target_bbox   — (x1, y1, x2, y2) normalised to [0, 1] within the crop
         target_class  — string label
         child_image   — PIL Image of the child crop (used as input for recursion),
@@ -363,7 +408,6 @@ def _traverse(full_img: Image.Image, node: BBox, samples: list,
     # Sort children left → right
     children = sorted(node.children, key=lambda c: c.x1)
 
-    working = node_crop.copy()
     prev_bbox = (0.0, 0.0, 0.0, 0.0, 0.0)  # none for first child
 
     for child in children:
@@ -375,7 +419,7 @@ def _traverse(full_img: Image.Image, node: BBox, samples: list,
             max(0.0, min(1.0, (child.y2 - ny1) / node_h)),
         )
 
-        # Child crop from the *original* (un-masked) image
+        # Child crop from the original image
         cx1 = max(0, int(child.x1))
         cy1 = max(0, int(child.y1))
         cx2 = min(full_img.width, int(child.x2))
@@ -383,7 +427,7 @@ def _traverse(full_img: Image.Image, node: BBox, samples: list,
         child_crop = full_img.crop((cx1, cy1, cx2, cy2)).copy()
 
         samples.append({
-            'input_image': working.copy(),
+            'input_image': node_crop,
             'target_bbox': rel,
             'target_class': child.label,
             'child_image': child_crop,
@@ -395,16 +439,9 @@ def _traverse(full_img: Image.Image, node: BBox, samples: list,
         prev_bbox = (rel[0], rel[1], rel[2], rel[3],
                      float(CLASS_TO_ID[child.label]))
 
-        # Mask the child out of the working image
-        mx1 = max(0, int(child.x1 - nx1))
-        my1 = max(0, int(child.y1 - ny1))
-        mx2 = min(node_w, int(child.x2 - nx1))
-        my2 = min(node_h, int(child.y2 - ny1))
-        ImageDraw.Draw(working).rectangle([mx1, my1, mx2, my2], fill='white')
-
     # Sentinel: no more children (prev_bbox is the last child detected)
     samples.append({
-        'input_image': working.copy(),
+        'input_image': node_crop,
         'target_bbox': (0.0, 0.0, 0.0, 0.0),
         'target_class': 'none',
         'child_image': None,
@@ -415,6 +452,53 @@ def _traverse(full_img: Image.Image, node: BBox, samples: list,
     # Recurse into each child
     for child in children:
         _traverse(full_img, child, samples, parent_label=child.label)
+
+
+# ──────────────────────────────────────────────────────────────────────────────
+# MIDI training sample extraction
+# ──────────────────────────────────────────────────────────────────────────────
+
+def extract_midi_training_samples(full_img: Image.Image, root: BBox):
+    """Walk tree, find melodic_line nodes, extract image crop + MIDI token sequence.
+
+    Returns a list of dicts:
+        melodic_line_image — PIL Image crop of the melodic line
+        midi_sequence      — list of MIDI note numbers (sorted left-to-right)
+        token_sequence     — list of tokens: [BOS, tok1, ..., tokN, EOS]
+    """
+    samples = []
+    _collect_melodic_lines(full_img, root, samples)
+    return samples
+
+
+def _collect_melodic_lines(full_img: Image.Image, node: BBox, samples: list):
+    if node.label == 'melodic_line' and node.children:
+        # Crop to melodic line bbox
+        x1 = max(0, int(node.x1))
+        y1 = max(0, int(node.y1))
+        x2 = min(full_img.width, int(node.x2))
+        y2 = min(full_img.height, int(node.y2))
+        if x2 - x1 > 0 and y2 - y1 > 0:
+            crop = full_img.crop((x1, y1, x2, y2)).copy()
+
+            # Collect notes sorted left-to-right
+            notes = sorted(
+                [c for c in node.children if c.label == 'note' and c.midi is not None],
+                key=lambda c: c.x1,
+            )
+            if notes:
+                midi_seq = [n.midi for n in notes]
+                token_seq = ([BOS_TOKEN]
+                             + [midi_to_token(m) for m in midi_seq]
+                             + [EOS_TOKEN])
+                samples.append({
+                    'melodic_line_image': crop,
+                    'midi_sequence': midi_seq,
+                    'token_sequence': token_seq,
+                })
+
+    for child in node.children:
+        _collect_melodic_lines(full_img, child, samples)
 
 
 # ──────────────────────────────────────────────────────────────────────────────
