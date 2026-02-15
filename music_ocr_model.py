@@ -28,6 +28,7 @@ import argparse
 import random
 from typing import List
 
+import cv2
 import numpy as np
 import torch
 import torch.nn as nn
@@ -136,11 +137,12 @@ class MusicOCRLoss(nn.Module):
     • CrossEntropy for classification (all samples)
     """
 
-    def __init__(self, bbox_weight=1.0, class_weight=1.0):
+    def __init__(self, bbox_weight=1.0, class_weight=1.0, cls_weights=None):
         super().__init__()
         self.bbox_weight = bbox_weight
         self.class_weight = class_weight
-        self.cls_loss_fn = nn.CrossEntropyLoss()
+        self.cls_loss_fn = nn.CrossEntropyLoss(
+            weight=cls_weights if cls_weights is not None else None)
         self.bbox_loss_fn = nn.SmoothL1Loss()
 
     def forward(self, bbox_pred, cls_pred, target_bbox, target_cls):
@@ -178,8 +180,10 @@ class TeacherForcingDataset(Dataset):
 
     def __init__(self, data_dir: str = None, num_images: int = 200,
                  retina_size: int = 1024, seed: int = 42,
-                 parent_filter: str = None):
+                 parent_filter: str = None, noise_std: float = 0.03):
         self.retina_size = retina_size
+        self.noise_std = noise_std
+        self.training = True  # toggled off for validation
         self.samples: List[dict] = []
 
         if data_dir and os.path.isfile(os.path.join(data_dir, 'annotations.json')):
@@ -218,7 +222,10 @@ class TeacherForcingDataset(Dataset):
 
     def __getitem__(self, idx):
         s = self.samples[idx]
-        retina_img, _, _, _ = fit_to_retina(s['input_image'], self.retina_size)
+        # Preprocess: remove horizontal staff lines so the model learns
+        # from line-free images (matching inference preprocessing).
+        clean_img = _remove_horizontal_lines(s['input_image'])
+        retina_img, _, _, _ = fit_to_retina(clean_img, self.retina_size)
         x = image_to_tensor(retina_img)                             # [3, R, R]
         bbox = torch.tensor(s['target_bbox'], dtype=torch.float32)  # [4]
         cls = torch.tensor(CLASS_TO_ID[s['target_class']], dtype=torch.long)
@@ -226,6 +233,12 @@ class TeacherForcingDataset(Dataset):
         # Previous bbox: (x1, y1, x2, y2, class_id)
         prev = s.get('prev_bbox', PREV_BBOX_NONE)
         prev_t = torch.tensor(prev, dtype=torch.float32)            # [5]
+
+        # Noise injection: perturb prev_bbox coords during training
+        # to reduce exposure bias (skip the zero sentinel)
+        if self.training and self.noise_std > 0 and prev != PREV_BBOX_NONE:
+            prev_t[:4] += torch.randn(4) * self.noise_std
+            prev_t[:4].clamp_(0.0, 1.0)
 
         return x, prev_t, bbox, cls
 
@@ -283,8 +296,21 @@ def train(args):
     scheduler = optim.lr_scheduler.ReduceLROnPlateau(
         optimizer, mode='min', factor=0.5, patience=5)
 
+    # Compute inverse-frequency class weights from training data
+    cls_counts = torch.zeros(len(CLASSES))
+    for idx in train_ds.indices:
+        s = full_dataset.samples[idx]
+        cls_counts[CLASS_TO_ID[s['target_class']]] += 1
+    cls_counts.clamp_(min=1)
+    inv_freq = cls_counts.sum() / (len(CLASSES) * cls_counts)
+    inv_freq.clamp_(max=3.0)
+    # Ensure 'none' gets at least 2.0x weight
+    inv_freq[NONE_CLASS_ID] = max(inv_freq[NONE_CLASS_ID].item(), 2.0)
+    print(f'Class weights: {dict(zip(CLASSES, inv_freq.tolist()))}', flush=True)
+
     # Loss
-    loss_fn = MusicOCRLoss(bbox_weight=1.0, class_weight=1.0).to(device)
+    loss_fn = MusicOCRLoss(bbox_weight=1.0, class_weight=1.0,
+                           cls_weights=inv_freq.to(device)).to(device)
 
     # Training
     num_batches = len(train_loader)
@@ -301,6 +327,7 @@ def train(args):
     for epoch in range(1, args.epochs + 1):
         # ── Train ──
         model.train()
+        full_dataset.training = True
         train_total = train_bbox = train_cls = 0.0
         train_n = 0
 
@@ -334,6 +361,7 @@ def train(args):
 
         # ── Validate ──
         model.eval()
+        full_dataset.training = False
         val_total = val_bbox = val_cls = 0.0
         val_n = 0
 
@@ -388,8 +416,13 @@ def train(args):
 
 @torch.no_grad()
 def predict(model: MusicOCRModel, image: Image.Image,
-            prev_bbox=None, retina_size: int = 1024, device=None):
-    """Run one forward pass and return (bbox_norm, class_name, confidence)."""
+            prev_bbox=None, retina_size: int = 1024, device=None,
+            parent_label: str = None):
+    """Run one forward pass and return (bbox_norm, class_name, confidence).
+
+    If parent_label is given, masks logits to only allow valid child classes
+    (+ 'none') per the VALID_CHILDREN hierarchy.
+    """
     if device is None:
         device = next(model.parameters()).device
     if prev_bbox is None:
@@ -400,44 +433,145 @@ def predict(model: MusicOCRModel, image: Image.Image,
     prev_t = torch.tensor([prev_bbox], dtype=torch.float32).to(device)
 
     bbox_pred, cls_pred = model(x, prev_t)
+    logits = cls_pred[0]
+
+    # Mask invalid child classes to -inf
+    if parent_label is not None and parent_label in VALID_CHILDREN:
+        valid = VALID_CHILDREN[parent_label] | {'none'}
+        mask = torch.full_like(logits, float('-inf'))
+        for cls_name in valid:
+            mask[CLASS_TO_ID[cls_name]] = 0.0
+        logits = logits + mask
+
     bbox = bbox_pred[0].cpu().tolist()
-    probs = torch.softmax(cls_pred[0], dim=0)
+    probs = torch.softmax(logits, dim=0)
     cls_id = probs.argmax().item()
     return bbox, CLASSES[cls_id], probs[cls_id].item()
 
 
+MAX_CHILDREN = {
+    'page': 4,
+    'staff_system': 4,
+    'melodic_line': 20,
+    'note': 3,
+}
+
+# Valid child classes for each parent (enforces hierarchy structure)
+VALID_CHILDREN = {
+    'page':         {'staff_system'},
+    'staff_system': {'staff_lines', 'melodic_line'},
+    'melodic_line': {'note', 'ledger_lines'},
+    'note':         {'ledger_lines'},
+    'staff_lines':  set(),       # leaf
+    'ledger_lines': set(),       # leaf
+}
+
+
+def _remove_horizontal_lines(image: Image.Image) -> Image.Image:
+    """Remove long horizontal lines (staff lines) from an image.
+
+    Returns a new PIL image with horizontal lines erased (replaced by white).
+    The original image is not modified.
+    """
+    gray = cv2.cvtColor(np.array(image), cv2.COLOR_RGB2GRAY)
+    _, binary = cv2.threshold(gray, 180, 255, cv2.THRESH_BINARY_INV)
+
+    # Detect horizontal lines — open with a wide horizontal kernel
+    h_len = max(image.width // 4, 15)
+    h_kernel = cv2.getStructuringElement(cv2.MORPH_RECT, (h_len, 1))
+    h_lines = cv2.morphologyEx(binary, cv2.MORPH_OPEN, h_kernel)
+
+    # Dilate the detected lines slightly so we fully cover them
+    h_lines = cv2.dilate(h_lines, np.ones((3, 1), np.uint8), iterations=1)
+
+    # Erase the lines from the original grayscale by setting those pixels
+    # to white, then convert back to RGB PIL image.
+    result = gray.copy()
+    result[h_lines > 0] = 255
+    return Image.fromarray(cv2.cvtColor(result, cv2.COLOR_GRAY2RGB))
+
+
+def _has_content(crop: Image.Image, area_threshold: float = 0.005,
+                 canny_low: int = 50, canny_high: int = 150) -> bool:
+    """Check if a crop (already preprocessed with staff lines removed) has
+    meaningful content using Canny edge detection and enclosed-region analysis.
+
+    Steps:
+      1. Run Canny edge detection on the (line-free) crop.
+      2. Dilate edges to connect nearby fragments, then find contours.
+      3. Compute the bounding-box area of each contour (the region
+         enclosed by its edges).
+      4. Return True if the total enclosed area fraction exceeds
+         *area_threshold*.
+    """
+    gray = cv2.cvtColor(np.array(crop), cv2.COLOR_RGB2GRAY)
+    edges = cv2.Canny(gray, canny_low, canny_high)
+
+    # Dilate to connect nearby edge fragments into regions
+    dilate_kern = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (5, 5))
+    dilated = cv2.dilate(edges, dilate_kern, iterations=1)
+
+    # Find contours and sum their bounding-rect areas (the region enclosed)
+    contours, _ = cv2.findContours(dilated, cv2.RETR_EXTERNAL,
+                                   cv2.CHAIN_APPROX_SIMPLE)
+    enclosed = 0.0
+    for c in contours:
+        _, _, bw, bh = cv2.boundingRect(c)
+        enclosed += bw * bh
+    return enclosed / max(gray.size, 1) >= area_threshold
+
+
 @torch.no_grad()
 def hierarchical_decode(model: MusicOCRModel, image: Image.Image,
-                        retina_size: int = 1024, max_depth: int = 10,
-                        max_detections: int = 500, device=None):
+                        retina_size: int = 1024, max_depth: int = 5,
+                        max_detections: int = 200, device=None):
     """
     Recursively decode the bounding-box hierarchy using autoregressive
     previous-bbox conditioning.  The image is never modified — the model
     relies solely on prev_bbox to advance through siblings.
+
+    Uses VALID_CHILDREN to constrain which classes can appear at each level,
+    preventing recursive class loops (e.g. melodic_line -> melodic_line).
+
+    As a preprocessing step, long horizontal lines (staff lines) are removed
+    from the image.  The cleaned version is used for Canny edge content
+    checks so that empty regions (containing only staff lines) are reliably
+    rejected.  The original image is still fed to the model for predictions
+    (since it was trained with staff lines present).
 
     Returns a BBox tree.
     """
     if device is None:
         device = next(model.parameters()).device
 
+    # Preprocessing: remove horizontal staff lines (matches training).
+    # The cleaned image is used for BOTH model input and content checks.
+    img = _remove_horizontal_lines(image)
+
     total_detections = 0
 
-    def _decode(img, depth):
+    def _decode(img, parent_label, depth):
         nonlocal total_detections
         if depth >= max_depth or img.width < 4 or img.height < 4:
+            return []
+
+        # Leaf nodes have no valid children
+        if parent_label in VALID_CHILDREN and not VALID_CHILDREN[parent_label]:
             return []
 
         parent_area = img.width * img.height
         children = []
         prev_bbox = PREV_BBOX_NONE
+        max_kids = MAX_CHILDREN.get(parent_label, 5)
 
-        for _ in range(20):  # per-node safety cap
+        for _ in range(max_kids):
             if total_detections >= max_detections:
                 break
 
             bbox_n, cls_name, conf = predict(
                 model, img, prev_bbox=prev_bbox,
-                retina_size=retina_size, device=device)
+                retina_size=retina_size, device=device,
+                parent_label=parent_label)
 
             if cls_name == 'none' or conf < 0.3:
                 break
@@ -456,10 +590,18 @@ def hierarchical_decode(model: MusicOCRModel, image: Image.Image,
             if child_area > 0.95 * parent_area:
                 break
 
+            # Canny edge content check (image is already line-free).
+            # Line-type classes bypass this (they may have no edges left).
+            child_crop = img.crop((x1, y1, x2, y2))
+            if cls_name not in ('staff_lines', 'ledger_lines'):
+                if not _has_content(child_crop):
+                    prev_bbox = (bbox_n[0], bbox_n[1], bbox_n[2], bbox_n[3],
+                                 float(CLASS_TO_ID[cls_name]))
+                    continue
+
             total_detections += 1
 
-            child_crop = img.crop((x1, y1, x2, y2))
-            sub_children = _decode(child_crop, depth + 1)
+            sub_children = _decode(child_crop, cls_name, depth + 1)
 
             # Offset sub-children from crop-local to parent coordinates
             offset_children = [
@@ -469,13 +611,12 @@ def hierarchical_decode(model: MusicOCRModel, image: Image.Image,
             children.append(BBox(x1, y1, x2, y2, cls_name,
                                  children=offset_children))
 
-            # Update prev_bbox for next iteration (normalised coords + class_id)
             prev_bbox = (bbox_n[0], bbox_n[1], bbox_n[2], bbox_n[3],
                          float(CLASS_TO_ID[cls_name]))
 
         return children
 
-    subs = _decode(image, 0)
+    subs = _decode(img, 'page', 0)
     return BBox(0, 0, image.width, image.height, 'page', children=subs)
 
 
@@ -569,6 +710,188 @@ def _find_content_regions(image, bg_color=(255, 255, 255),
 
 
 # ──────────────────────────────────────────────────────────────────────────────
+# Bottom-up detection (adapted from tiny-tessarachnid)
+# ──────────────────────────────────────────────────────────────────────────────
+
+def _generate_candidate_boxes(region_crop, bg_color=(255, 255, 255),
+                               gap_tolerance=1, scan_axis='cols'):
+    """Generate candidate boxes from a region image.
+
+    Uses content regions as natural candidate boxes.  For regions whose
+    primary dimension exceeds 1.5× the expected size (touching symbols),
+    generates overlapping sub-windows at stride = expected_size // 2.
+    """
+    regions = _find_content_regions(region_crop, bg_color,
+                                    gap_tolerance=gap_tolerance,
+                                    scan_axis=scan_axis)
+    if not regions:
+        return []
+
+    # Estimate expected size from median region dimension along scan axis
+    if scan_axis == 'cols':
+        sizes = [r[2] - r[0] for r in regions]   # widths
+    else:
+        sizes = [r[3] - r[1] for r in regions]   # heights
+    expected_size = int(np.median(sizes)) if sizes else 1
+    expected_size = max(expected_size, 1)
+
+    candidates = []
+    for (x1, y1, x2, y2) in regions:
+        if scan_axis == 'cols':
+            dim = x2 - x1
+            if dim <= expected_size * 1.5:
+                candidates.append((x1, y1, x2, y2))
+            else:
+                stride = max(expected_size // 2, 1)
+                for sx in range(x1, x2 - expected_size + 1, stride):
+                    candidates.append((sx, y1, sx + expected_size, y2))
+                if candidates and candidates[-1][2] < x2:
+                    candidates.append((x2 - expected_size, y1, x2, y2))
+        else:
+            dim = y2 - y1
+            if dim <= expected_size * 1.5:
+                candidates.append((x1, y1, x2, y2))
+            else:
+                stride = max(expected_size // 2, 1)
+                for sy in range(y1, y2 - expected_size + 1, stride):
+                    candidates.append((x1, sy, x2, sy + expected_size))
+                if candidates and candidates[-1][3] < y2:
+                    candidates.append((x1, y2 - expected_size, x2, y2))
+
+    return candidates
+
+
+@torch.no_grad()
+def _classify_candidates_batched(model, region_crop, bg_color, candidates,
+                                  device, retina_size=1024, batch_size=32,
+                                  parent_label=None):
+    """Classify candidate boxes in batches.
+
+    For each candidate: crop from region image, pad to match pretraining
+    distribution (~1/5th occupancy), fit to retina, run model with
+    prev_bbox = PREV_BBOX_NONE.
+
+    If *parent_label* is given, logits are masked to only allow valid child
+    classes (+ 'none') per VALID_CHILDREN.
+
+    Returns list of (box, class_name, confidence) for non-'none' predictions.
+    """
+    results = []
+    prev_t = torch.tensor([PREV_BBOX_NONE], dtype=torch.float32).to(device)
+
+    # Build valid-child mask once if needed
+    valid_mask = None
+    if parent_label is not None and parent_label in VALID_CHILDREN:
+        valid = VALID_CHILDREN[parent_label] | {'none'}
+        valid_mask = torch.full((len(CLASSES),), float('-inf'), device=device)
+        for cls_name in valid:
+            valid_mask[CLASS_TO_ID[cls_name]] = 0.0
+
+    for i in range(0, len(candidates), batch_size):
+        batch_boxes = candidates[i:i + batch_size]
+        imgs = []
+        for (x1, y1, x2, y2) in batch_boxes:
+            crop = region_crop.crop((x1, y1, x2, y2))
+            cw, ch = crop.size
+            if cw == 0 or ch == 0:
+                continue
+            # Pad to match pretraining distribution (symbol occupies ~1/5th)
+            pad_x = cw * 2
+            pad_y = ch * 2
+            padded = Image.new('RGB', (cw + pad_x * 2, ch + pad_y * 2),
+                               bg_color)
+            padded.paste(crop, (pad_x, pad_y))
+            retina_img, _, _, _ = fit_to_retina(padded, retina_size)
+            img_t = image_to_tensor(retina_img)
+            imgs.append((img_t, (x1, y1, x2, y2)))
+
+        if not imgs:
+            continue
+
+        img_batch = torch.stack([t for t, _ in imgs]).to(device)
+        prev_batch = prev_t.expand(img_batch.size(0), -1)
+
+        _, cls_pred = model(img_batch, prev_batch)
+
+        logits = cls_pred
+        if valid_mask is not None:
+            logits = logits + valid_mask.unsqueeze(0)
+
+        probs = torch.softmax(logits, dim=1)
+        cls_ids = probs.argmax(dim=1)
+        confidences = probs.gather(1, cls_ids.unsqueeze(1)).squeeze(1)
+
+        for j, (_, box) in enumerate(imgs):
+            cid = cls_ids[j].item()
+            cls_name = CLASSES[cid]
+            conf = confidences[j].item()
+            if cls_name != 'none':
+                results.append((box, cls_name, conf))
+
+    return results
+
+
+def _iou(box_a, box_b):
+    """Compute intersection-over-union of two (x1, y1, x2, y2) boxes."""
+    xa = max(box_a[0], box_b[0])
+    ya = max(box_a[1], box_b[1])
+    xb = min(box_a[2], box_b[2])
+    yb = min(box_a[3], box_b[3])
+    inter = max(0, xb - xa) * max(0, yb - ya)
+    area_a = (box_a[2] - box_a[0]) * (box_a[3] - box_a[1])
+    area_b = (box_b[2] - box_b[0]) * (box_b[3] - box_b[1])
+    union = area_a + area_b - inter
+    return inter / union if union > 0 else 0.0
+
+
+def _nms(detections, iou_threshold=0.3):
+    """Non-maximum suppression on detections.
+
+    detections: list of (box, class_name, confidence)
+    Returns filtered list of (box, class_name) sorted left-to-right.
+    """
+    if not detections:
+        return []
+
+    dets = sorted(detections, key=lambda d: d[2], reverse=True)
+    keep = []
+
+    while dets:
+        best = dets.pop(0)
+        keep.append(best)
+        dets = [d for d in dets if _iou(best[0], d[0]) < iou_threshold]
+
+    keep.sort(key=lambda d: d[0][0])
+    return [(box, cls_name) for box, cls_name, _ in keep]
+
+
+def _detect_bottom_up(model, region_crop, device, retina_size=1024,
+                       bg_color=(255, 255, 255), gap_tolerance=1,
+                       scan_axis='cols', iou_threshold=0.3,
+                       confidence_threshold=0.1, batch_size=32,
+                       parent_label=None):
+    """Bottom-up detection: candidates → classify → NMS.
+
+    Returns [(bbox, class_name), ...] in left-to-right order.
+    """
+    candidates = _generate_candidate_boxes(region_crop, bg_color,
+                                            gap_tolerance=gap_tolerance,
+                                            scan_axis=scan_axis)
+    if not candidates:
+        return []
+
+    detections = _classify_candidates_batched(
+        model, region_crop, bg_color, candidates, device,
+        retina_size=retina_size, batch_size=batch_size,
+        parent_label=parent_label)
+
+    # Filter by confidence
+    detections = [d for d in detections if d[2] >= confidence_threshold]
+
+    return _nms(detections, iou_threshold=iou_threshold)
+
+
+# ──────────────────────────────────────────────────────────────────────────────
 # Hybrid inference (pixel analysis + model classification)
 # ──────────────────────────────────────────────────────────────────────────────
 
@@ -647,8 +970,14 @@ def hierarchical_decode_hybrid(model, image, retina_size=1024,
     Uses different scan parameters at each hierarchy level:
       - page → staff_systems:        row-scan, gap_tolerance=20
       - staff_system → children:     row-scan, gap_tolerance=3
-      - melodic_line → notes:        col-scan, gap_tolerance=3
-      - note → components:           col-scan, gap_tolerance=1
+      - melodic_line → notes:        bottom-up (candidates → classify → NMS)
+      - note → ledger_lines:         row-scan, gap_tolerance=3
+
+    The melodic_line level uses bottom-up detection (adapted from
+    tiny-tessarachnid): pixel analysis generates candidate boxes, each
+    candidate is independently classified in batches, then NMS filters
+    overlapping detections.  This avoids autoregressive error accumulation
+    at the most granular detection level.
 
     Returns a BBox tree.
     """
@@ -656,12 +985,18 @@ def hierarchical_decode_hybrid(model, image, retina_size=1024,
         device = next(model.parameters()).device
 
     # Scan parameters per parent label
+    # staff_lines and ledger_lines are leaves — no children to decode
     LEVEL_PARAMS = {
         'page':         {'scan_axis': 'rows', 'gap_tolerance': 20},
         'staff_system': {'scan_axis': 'rows', 'gap_tolerance': 3},
         'melodic_line': {'scan_axis': 'cols', 'gap_tolerance': 3},
-        'note':         {'scan_axis': 'cols', 'gap_tolerance': 1},
+        'note':         {'scan_axis': 'rows', 'gap_tolerance': 3},
     }
+
+    # Levels that use bottom-up detection (candidates → classify → NMS)
+    # instead of autoregressive counting.  melodic_line → notes is the
+    # leaf-like level analogous to line → characters in OCR.
+    BOTTOM_UP_LEVELS = {'melodic_line'}
 
     def _decode(img, parent_label, depth):
         if depth >= max_depth or img.width < 4 or img.height < 4:
@@ -670,13 +1005,22 @@ def hierarchical_decode_hybrid(model, image, retina_size=1024,
         params = LEVEL_PARAMS.get(parent_label,
                                   {'scan_axis': 'cols', 'gap_tolerance': 3})
 
-        detections = detect_level(
-            model, img, device, retina_size=retina_size,
-            bg_color=bg_color, max_detections=50,
-            gap_tolerance=params['gap_tolerance'],
-            scan_axis=params['scan_axis'],
-            mask_model=mask_model,
-        )
+        if parent_label in BOTTOM_UP_LEVELS:
+            detections = _detect_bottom_up(
+                model, img, device, retina_size=retina_size,
+                bg_color=bg_color,
+                gap_tolerance=params['gap_tolerance'],
+                scan_axis=params['scan_axis'],
+                parent_label=parent_label,
+            )
+        else:
+            detections = detect_level(
+                model, img, device, retina_size=retina_size,
+                bg_color=bg_color, max_detections=50,
+                gap_tolerance=params['gap_tolerance'],
+                scan_axis=params['scan_axis'],
+                mask_model=mask_model,
+            )
 
         children = []
         for (x1, y1, x2, y2), cls_name in detections:

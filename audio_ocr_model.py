@@ -359,6 +359,259 @@ def hierarchical_decode(model: AudioOCRModel,
 
 
 # ──────────────────────────────────────────────────────────────────────────────
+# Bottom-up note detection (adapted from tiny-tessarachnid)
+# ──────────────────────────────────────────────────────────────────────────────
+
+def _find_spec_content_regions(spec_db, gap_tolerance=1,
+                                energy_threshold=None):
+    """Find temporal content regions in a spectrogram.
+
+    Scans columns (time frames) for energy above *energy_threshold*
+    (defaults to SPEC_FLOOR_DB + 10 dB).
+
+    Returns a list of (start_frame, end_frame) tuples.
+    """
+    if energy_threshold is None:
+        energy_threshold = SPEC_FLOOR_DB + 10.0
+
+    col_has_content = (spec_db > energy_threshold).any(axis=0)
+    n_frames = spec_db.shape[1]
+
+    regions = []
+    in_region = False
+    region_start = 0
+    gap_count = 0
+
+    for i in range(n_frames):
+        if col_has_content[i]:
+            if not in_region:
+                region_start = i
+                in_region = True
+            gap_count = 0
+        else:
+            if in_region:
+                gap_count += 1
+                if gap_count > gap_tolerance:
+                    regions.append((region_start, i - gap_count))
+                    in_region = False
+
+    if in_region:
+        region_end = n_frames - 1
+        while region_end > region_start and not col_has_content[region_end]:
+            region_end -= 1
+        regions.append((region_start, region_end + 1))
+
+    return regions
+
+
+def _generate_temporal_candidates(spec_db, gap_tolerance=1,
+                                   energy_threshold=None):
+    """Generate candidate temporal windows from a spectrogram.
+
+    Uses temporal content regions as natural windows.  For regions wider
+    than 1.5× the expected note width, generates overlapping sub-windows
+    at stride = expected_width // 2.
+    """
+    regions = _find_spec_content_regions(spec_db, gap_tolerance,
+                                         energy_threshold)
+    if not regions:
+        return []
+
+    widths = [r[1] - r[0] for r in regions]
+    expected_w = int(np.median(widths)) if widths else 1
+    expected_w = max(expected_w, 1)
+
+    candidates = []
+    for (sf, ef) in regions:
+        w = ef - sf
+        if w <= expected_w * 1.5:
+            candidates.append((sf, ef))
+        else:
+            stride = max(expected_w // 2, 1)
+            for sx in range(sf, ef - expected_w + 1, stride):
+                candidates.append((sx, sx + expected_w))
+            if candidates and candidates[-1][1] < ef:
+                candidates.append((ef - expected_w, ef))
+
+    return candidates
+
+
+@torch.no_grad()
+def _classify_audio_candidates_batched(model, spec_db, candidates, device,
+                                        retina_size=1024, batch_size=32):
+    """Classify temporal candidate windows in batches.
+
+    For each candidate: crop the spectrogram to the time window, pad
+    temporally to match training distribution (~1/5th occupancy),
+    convert to image, fit to retina, run model.
+
+    Returns list of ((start, end), freq_mask, class_name, confidence)
+    for non-'none' predictions.
+    """
+    results = []
+
+    for i in range(0, len(candidates), batch_size):
+        batch_windows = candidates[i:i + batch_size]
+        imgs = []
+        for (sf, ef) in batch_windows:
+            sub_spec = spec_db[:, sf:ef]
+            if sub_spec.shape[1] < 2:
+                continue
+            # Pad temporally to match training distribution
+            n_pad = sub_spec.shape[1] * 2
+            padded = np.full(
+                (spec_db.shape[0], sub_spec.shape[1] + n_pad * 2),
+                SPEC_FLOOR_DB, dtype=np.float32)
+            padded[:, n_pad:n_pad + sub_spec.shape[1]] = sub_spec
+            spec_img = spectrogram_to_image(padded)
+            retina_img, _, _, _ = fit_to_retina(spec_img, retina_size)
+            img_t = image_to_tensor(retina_img)
+            imgs.append((img_t, (sf, ef)))
+
+        if not imgs:
+            continue
+
+        img_batch = torch.stack([t for t, _ in imgs]).to(device)
+        _, m_pred, c_pred = model(img_batch)
+
+        probs = torch.softmax(c_pred, dim=1)
+        cls_ids = probs.argmax(dim=1)
+        confidences = probs.gather(1, cls_ids.unsqueeze(1)).squeeze(1)
+        freq_masks = (m_pred > 0.5)
+
+        for j, (_, window) in enumerate(imgs):
+            cid = cls_ids[j].item()
+            cls_name = AUDIO_CLASSES[cid]
+            conf = confidences[j].item()
+            if cls_name != 'none':
+                fmask = freq_masks[j].cpu().tolist()
+                results.append((window, fmask, cls_name, conf))
+
+    return results
+
+
+def _temporal_iou(a, b):
+    """Compute 1D IoU of two (start, end) intervals."""
+    inter = max(0, min(a[1], b[1]) - max(a[0], b[0]))
+    union = (a[1] - a[0]) + (b[1] - b[0]) - inter
+    return inter / union if union > 0 else 0.0
+
+
+def _temporal_nms(detections, iou_threshold=0.3):
+    """Non-maximum suppression on temporal detections.
+
+    detections: list of ((start, end), freq_mask, class_name, confidence)
+    Returns filtered list sorted by start time.
+    """
+    if not detections:
+        return []
+
+    dets = sorted(detections, key=lambda d: d[3], reverse=True)
+    keep = []
+
+    while dets:
+        best = dets.pop(0)
+        keep.append(best)
+        dets = [d for d in dets if _temporal_iou(best[0], d[0]) < iou_threshold]
+
+    keep.sort(key=lambda d: d[0][0])
+    return keep
+
+
+def _detect_audio_bottom_up(model, spec_db, device, retina_size=1024,
+                              gap_tolerance=1, energy_threshold=None,
+                              iou_threshold=0.3, confidence_threshold=0.1,
+                              batch_size=32):
+    """Bottom-up audio detection: temporal candidates → classify → NMS.
+
+    Returns [AudioBBox, ...] sorted by start time.
+    """
+    candidates = _generate_temporal_candidates(spec_db, gap_tolerance,
+                                                energy_threshold)
+    if not candidates:
+        return []
+
+    detections = _classify_audio_candidates_batched(
+        model, spec_db, candidates, device,
+        retina_size=retina_size, batch_size=batch_size)
+
+    # Filter by confidence
+    detections = [d for d in detections if d[3] >= confidence_threshold]
+
+    kept = _temporal_nms(detections, iou_threshold=iou_threshold)
+    return [AudioBBox(sf, ef, fmask, cls_name, children=[])
+            for (sf, ef), fmask, cls_name, _ in kept]
+
+
+@torch.no_grad()
+def hierarchical_decode_hybrid(model: AudioOCRModel,
+                                spec: np.ndarray,
+                                retina_size: int = 1024,
+                                max_depth: int = 8,
+                                device=None) -> AudioBBox:
+    """
+    Decode AudioBBox tree using bottom-up detection at the note level.
+
+    At higher levels (full_mix → instrument_part → phrase), uses the
+    original iterative masking approach.  At the phrase level (detecting
+    notes), switches to bottom-up: temporal candidates → classify → NMS.
+    This avoids autoregressive error accumulation at the most granular
+    detection level.
+    """
+    if device is None:
+        device = next(model.parameters()).device
+
+    n_mels, n_frames = spec.shape
+
+    # Parent classes whose children are detected bottom-up
+    BOTTOM_UP_PARENTS = {'phrase'}
+
+    def _decode(sub_spec, parent_cls, depth):
+        if depth > max_depth or sub_spec.shape[1] < 2:
+            return []
+
+        # Bottom-up for note-level detection
+        if parent_cls in BOTTOM_UP_PARENTS:
+            return _detect_audio_bottom_up(
+                model, sub_spec, device, retina_size=retina_size)
+
+        # Standard iterative masking for higher levels
+        children = []
+        working = sub_spec.copy()
+        n_f = working.shape[1]
+
+        for _ in range(30):
+            start, end, fmask, cls, conf = predict(
+                model, working, retina_size, device)
+            if cls == 'none' or conf < 0.3:
+                break
+
+            sf = int(start * n_f)
+            ef = int(end * n_f)
+            sf = max(0, min(n_f - 1, sf))
+            ef = max(sf + 1, min(n_f, ef))
+
+            fmask_list = fmask.tolist()
+
+            # Zoom: crop + freq-mask for recursion
+            zoom = sub_spec[:, sf:ef].copy()
+            zoom[~fmask, :] = SPEC_FLOOR_DB
+
+            sub_children = _decode(zoom, cls, depth + 1)
+            children.append(AudioBBox(sf, ef, fmask_list, cls,
+                                      children=sub_children))
+
+            # Mask out of working spectrogram
+            working[fmask, sf:ef] = SPEC_FLOOR_DB
+
+        return children
+
+    subs = _decode(spec, 'full_mix', 0)
+    return AudioBBox(0, n_frames, [True] * n_mels, 'full_mix',
+                     children=subs)
+
+
+# ──────────────────────────────────────────────────────────────────────────────
 # Inference on a WAV or spectrogram image
 # ──────────────────────────────────────────────────────────────────────────────
 
