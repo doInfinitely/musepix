@@ -293,9 +293,14 @@ def main():
         model = train_model(args, device)
     elif args.checkpoint:
         print(f"Loading checkpoint: {args.checkpoint}")
-        model = MusicOCRModel(num_classes=len(CLASSES)).to(device)
-        model.load_state_dict(
-            torch.load(args.checkpoint, map_location=device, weights_only=True))
+        state_dict = torch.load(args.checkpoint, map_location=device, weights_only=True)
+        # Detect num_classes from checkpoint (cls_head.2.bias shape)
+        ckpt_num_classes = state_dict['cls_head.2.bias'].shape[0]
+        if ckpt_num_classes != len(CLASSES):
+            print(f"  Note: checkpoint has {ckpt_num_classes} classes, "
+                  f"current CLASSES has {len(CLASSES)} — using checkpoint's count")
+        model = MusicOCRModel(num_classes=ckpt_num_classes).to(device)
+        model.load_state_dict(state_dict)
     else:
         print("No checkpoint provided and --train not set.")
         print("Using randomly initialised model (sanity check mode).")

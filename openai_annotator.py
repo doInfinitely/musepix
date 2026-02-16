@@ -8,8 +8,8 @@ Pipeline:
 The output matches annotations.json format for direct use with TeacherForcingDataset.
 
 Hierarchy:
-  page > staff_system > staff_lines > staff_line
-                      > melodic_line > note > notehead / stem / ledger_line
+  page > staff_system > staff_lines (leaf)
+                      > melodic_line > note > ledger_lines (optional bundle)
 
 Usage:
   python3 openai_annotator.py annotate --image path/to/image.png
@@ -28,9 +28,8 @@ from generate_sheet_music import BBox, CLASSES
 CHILDREN_OF = {
     'page': ['staff_system'],
     'staff_system': ['staff_lines', 'melodic_line'],
-    'staff_lines': ['staff_line'],
     'melodic_line': ['note'],
-    'note': ['notehead', 'stem', 'ledger_line'],
+    'note': ['ledger_lines'],
 }
 
 # Reverse: child → valid parent label
@@ -40,12 +39,12 @@ for parent, kids in CHILDREN_OF.items():
         PARENT_OF[kid] = parent
 
 # Labels that are leaves (no children)
-LEAF_LABELS = {'staff_line', 'notehead', 'stem', 'ledger_line'}
+LEAF_LABELS = {'staff_lines', 'ledger_lines'}
 
 # Processing order: parents before children
 LEVEL_ORDER = [
     'page', 'staff_system', 'staff_lines', 'melodic_line',
-    'note', 'staff_line', 'notehead', 'stem', 'ledger_line',
+    'note', 'ledger_lines',
 ]
 
 
@@ -78,12 +77,10 @@ The image is {width}x{height} pixels. All coordinates must be within these bound
 Element types to detect:
 - staff_system: the full region containing a set of staff lines plus any notes
 - staff_lines: the rectangular region spanning all 5 staff lines (just the lines, no notes)
-- staff_line: each individual horizontal staff line (5 per staff)
 - melodic_line: a horizontal group of consecutive notes on the staff
-- note: each individual note (notehead + stem + any ledger lines)
-- notehead: the oval/filled head of each note
-- stem: the vertical line attached to each notehead
-- ledger_line: any short horizontal line above or below the staff for high/low notes
+- note: the entire note including notehead, stem, and any ledger lines (one bbox per note)
+- ledger_lines: the bundle of short horizontal lines above or below the staff for a note \
+(one bbox encompassing all ledger lines for that note, not individual lines)
 
 Return a JSON object with a single key "elements" containing a list. Each element is:
 {{"label": "<element_type>", "bbox": [x1, y1, x2, y2]}}
@@ -91,7 +88,7 @@ Return a JSON object with a single key "elements" containing a list. Each elemen
 where (x1, y1) is the top-left corner and (x2, y2) is the bottom-right corner in pixels.
 
 Detect ALL instances of each element type. Be precise with bounding boxes — they should \
-tightly enclose each element.
+tightly enclose each element. Do NOT create thin bounding boxes for individual lines or stems.
 """
 
 

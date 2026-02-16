@@ -2,7 +2,7 @@
 Synthetic sheet music generator with hierarchical bounding boxes.
 
 Generates random melodies on a musical staff using PIL.  Every drawn element
-(staff lines, noteheads, stems, ledger lines) gets a bounding box.  Notes
+(staff lines, noteheads, stems, ledger lines) gets drawn.  Notes
 are grouped into melodic lines that split whenever the pitch range would
 exceed an octave.
 
@@ -75,12 +75,9 @@ CLASSES = [
     'page',           # 1
     'staff_system',   # 2
     'staff_lines',    # 3
-    'staff_line',     # 4
-    'melodic_line',   # 5
-    'note',           # 6
-    'notehead',       # 7
-    'stem',           # 8
-    'ledger_line',    # 9
+    'melodic_line',   # 4
+    'note',           # 5
+    'ledger_lines',   # 6  — bundle of ledger lines for a note
 ]
 CLASS_TO_ID = {c: i for i, c in enumerate(CLASSES)}
 
@@ -254,39 +251,33 @@ class SheetMusicGenerator:
     def _draw_and_annotate(self, draw, notes, melodic_lines):
         ls = self.line_spacing
 
-        # ── staff lines ──
-        staff_line_bboxes = []
+        # ── staff lines (single bbox, no individual line children) ──
         sl_x1 = self.staff_margin_left
         sl_x2 = self.image_width - self.staff_margin_right
         for i in range(5):
             y = self.staff_top_y + i * ls
             draw.line([(sl_x1, y), (sl_x2, y)], fill='black', width=1)
-            staff_line_bboxes.append(
-                BBox(sl_x1, y - 1, sl_x2, y + 1, 'staff_line'))
 
         staff_lines_bbox = BBox(
             sl_x1, self.staff_top_y - 1,
             sl_x2, self.bottom_line_y + 1,
             'staff_lines',
-            children=staff_line_bboxes,
         )
 
         # ── notes ──
         note_bboxes: List[BBox] = []
         for octave, note_idx, x in notes:
-            children: List[BBox] = []
             sp = pitch_to_staff_position(octave, note_idx)
             cy = staff_position_to_y(sp, self.bottom_line_y, ls)
 
-            # notehead (filled ellipse)
+            # notehead (filled ellipse) — draw only, no child bbox
             nh_x1 = x - self.notehead_w // 2
             nh_y1 = cy - self.notehead_h // 2
             nh_x2 = x + self.notehead_w // 2
             nh_y2 = cy + self.notehead_h // 2
             draw.ellipse([nh_x1, nh_y1, nh_x2, nh_y2], fill='black')
-            children.append(BBox(nh_x1, nh_y1, nh_x2, nh_y2, 'notehead'))
 
-            # stem
+            # stem — draw only, no child bbox
             stem_up = sp < 4  # below middle line ⇒ stem up (right side)
             if stem_up:
                 sx = nh_x2
@@ -295,40 +286,53 @@ class SheetMusicGenerator:
                 sx = nh_x1
                 sy1, sy2 = cy, cy + self.stem_length
             draw.line([(sx, sy1), (sx, sy2)], fill='black', width=2)
-            children.append(
-                BBox(sx - 1, min(sy1, sy2), sx + 1, max(sy1, sy2), 'stem'))
+
+            # Track extents for the encompassing note bbox
+            note_x1 = min(nh_x1, sx - 1)
+            note_y1 = min(nh_y1, min(sy1, sy2))
+            note_x2 = max(nh_x2, sx + 1)
+            note_y2 = max(nh_y2, max(sy1, sy2))
+
+            # ledger lines — draw and collect positions for bundle bbox
+            ledger_ys = []
+            ll_x1 = x - self.notehead_w // 2 - 4
+            ll_x2 = x + self.notehead_w // 2 + 4
 
             # ledger lines (below staff)
             if sp <= -2:
                 lowest = sp if sp % 2 == 0 else sp + 1  # round toward 0
                 for lp in range(-2, lowest - 1, -2):
                     ly = staff_position_to_y(lp, self.bottom_line_y, ls)
-                    ll_x1 = x - self.notehead_w // 2 - 4
-                    ll_x2 = x + self.notehead_w // 2 + 4
                     draw.line([(ll_x1, ly), (ll_x2, ly)],
                               fill='black', width=1)
-                    children.append(
-                        BBox(ll_x1, ly - 1, ll_x2, ly + 1, 'ledger_line'))
+                    ledger_ys.append(ly)
 
             # ledger lines (above staff)
             if sp >= 10:
                 highest = sp if sp % 2 == 0 else sp - 1
                 for lp in range(10, highest + 1, 2):
                     ly = staff_position_to_y(lp, self.bottom_line_y, ls)
-                    ll_x1 = x - self.notehead_w // 2 - 4
-                    ll_x2 = x + self.notehead_w // 2 + 4
                     draw.line([(ll_x1, ly), (ll_x2, ly)],
                               fill='black', width=1)
-                    children.append(
-                        BBox(ll_x1, ly - 1, ll_x2, ly + 1, 'ledger_line'))
+                    ledger_ys.append(ly)
 
-            # encompassing note bbox
-            all_x = [c.x1 for c in children] + [c.x2 for c in children]
-            all_y = [c.y1 for c in children] + [c.y2 for c in children]
+            # Build note children: single ledger_lines bundle if any
+            note_children: List[BBox] = []
+            if ledger_ys:
+                bundle_y1 = min(ledger_ys) - 1
+                bundle_y2 = max(ledger_ys) + 1
+                note_children.append(
+                    BBox(ll_x1, bundle_y1, ll_x2, bundle_y2, 'ledger_lines'))
+                # Expand note bbox to include ledger lines
+                note_x1 = min(note_x1, ll_x1)
+                note_y1 = min(note_y1, bundle_y1)
+                note_x2 = max(note_x2, ll_x2)
+                note_y2 = max(note_y2, bundle_y2)
+
             midi_num = octave_note_to_midi(octave, note_idx)
             note_bboxes.append(
-                BBox(min(all_x), min(all_y), max(all_x), max(all_y),
-                     'note', children=children, midi=midi_num))
+                BBox(note_x1, note_y1, note_x2, note_y2,
+                     'note', children=note_children, midi=midi_num))
 
         # ── melodic line bboxes ──
         ml_bboxes = []
